@@ -1,0 +1,10 @@
+cat > .gitignore <<'EOF'
+.DS_Store
+__pycache__/
+*.pyc
+*.mp4
+*.avi
+*.mov
+*.tmp
+.env
+EOF

@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Violence & Weapon Detection</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; background:#0f1115; color:#eee; }
+  h1 { font-size: 1.5rem; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
+  .tab-btn { padding: 8px 16px; border: 1px solid #444; background: #1b1e24; color: #eee; border-radius: 6px; cursor: pointer; }
+  .tab-btn.active { background: #3b6ef5; border-color: #3b6ef5; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  video, canvas { max-width: 100%; border-radius: 8px; }
+  video { background: #000; }
+  #overlay { background: transparent; }
+  #liveWrap { position: relative; display: inline-block; }
+  #overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+  .result-box { margin-top: 16px; padding: 14px; border-radius: 8px; background: #1b1e24; }
+  .badge { display:inline-block; padding: 4px 10px; border-radius: 20px; font-weight: 600; }
+  .violence { background: #4a1414; color: #ff6b6b; }
+  .nonviolence { background: #113d1c; color: #6bff8f; }
+  button.action { padding: 10px 18px; border-radius: 6px; border: none; background: #3b6ef5; color: white; cursor: pointer; font-size: 1rem; }
+  button.action:disabled { opacity: 0.5; cursor: not-allowed; }
+  #uploadResultVideo { margin-top: 12px; }
+  small.note { color: #999; }
+</style>
+</head>
+<body>
+
+<h1>Violence & Weapon Detection</h1>
+<p><small class="note">Upload a video for full analysis, or open your camera for a live (near-real-time) check. Violence detection needs a short buffered clip; weapon detection runs frame-by-frame.</small></p>
+
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchTab('upload')">Upload Video</button>
+  <button class="tab-btn" onclick="switchTab('live')">Live Camera</button>
+</div>
+
+<!-- UPLOAD TAB -->
+<div id="upload" class="panel active">
+  <input type="file" id="videoFile" accept="video/*">
+  <button class="action" onclick="uploadVideo()">Analyze Video</button>
+  <div id="uploadStatus"></div>
+  <div id="uploadResult" class="result-box" style="display:none;"></div>
+  <video id="uploadResultVideo" controls style="display:none;"></video>
+</div>
+
+<!-- LIVE TAB -->
+<div id="live" class="panel">
+  <button class="action" id="camBtn" onclick="toggleCamera()">Start Camera</button>
+  <br><br>
+  <div id="liveWrap">
+    <video id="webcam" autoplay muted playsinline width="480" height="360" style="display:none;"></video>
+    <canvas id="overlay" width="480" height="360" style="display:none;"></canvas>
+  </div>
+  <div class="result-box">
+    <div id="weaponStatus">Weapon check: —</div>
+    <div id="violenceStatus" style="margin-top:8px;">Violence check: — (checks every ~6s once buffer fills)</div>
+  </div>
+</div>
+
+<script>
+function switchTab(name) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(name).classList.add('active');
+  event.target.classList.add('active');
+  if (name !== 'live' && camActive) toggleCamera(); // stop camera when leaving tab
+}
+
+// ---------------- Upload flow ----------------
+async function uploadVideo() {
+  const fileInput = document.getElementById('videoFile');
+  if (!fileInput.files.length) { alert('Choose a video first'); return; }
+  const statusEl = document.getElementById('uploadStatus');
+  const resultEl = document.getElementById('uploadResult');
+  const videoEl = document.getElementById('uploadResultVideo');
+  statusEl.textContent = 'Analyzing... this can take 10-40s on CPU hosting.';
+  resultEl.style.display = 'none';
+  videoEl.style.display = 'none';
+
+  const formData = new FormData();
+  formData.append('file', fileInput.files[0]);
+
+  try {
+    const res = await fetch('/predict_video', { method: 'POST', body: formData });
+    const data = await res.json();
+    statusEl.textContent = '';
+    if (data.error) { resultEl.style.display='block'; resultEl.textContent = 'Error: ' + data.error; return; }
+
+    const badgeClass = data.label === 'Violence' ? 'violence' : 'nonviolence';
+    resultEl.innerHTML = `
+      <span class="badge ${badgeClass}">${data.label}</span>
+      <p>Confidence: ${(data.violence_prob*100).toFixed(1)}%</p>
+      <p>Audio used: ${data.audio_used ? 'Yes' : 'No (fallback)'}</p>
+      <p>Weapons detected: ${Object.keys(data.weapons_detected).length ? JSON.stringify(data.weapons_detected) : 'None'}</p>
+    `;
+    resultEl.style.display = 'block';
+    videoEl.src = data.annotated_video_url + '?t=' + Date.now();  // cache-bust so each new upload actually reloads
+    videoEl.load();
+    videoEl.style.display = 'block';
+  } catch (e) {
+    statusEl.textContent = 'Request failed: ' + e;
+  }
+}
+
+// ---------------- Live camera flow ----------------
+let camActive = false;
+let camStream = null;
+let frameBuffer = [];          // rolling buffer of {dataUrl, t}
+let weaponInterval = null;
+let violenceInterval = null;
+let mediaRecorder = null;
+let audioChunks = [];
+
+const NUM_FRAMES = 16;
+const BUFFER_SECONDS = 3;      // frames span the last ~3s
+
+async function toggleCamera() {
+  const btn = document.getElementById('camBtn');
+  const videoEl = document.getElementById('webcam');
+  const overlay = document.getElementById('overlay');
+
+  if (!camActive) {
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360 }, audio: true });
+    } catch (e) {
+      alert('Camera/mic access denied or unavailable: ' + e);
+      return;
+    }
+    videoEl.srcObject = camStream;
+    videoEl.style.display = 'block';
+    overlay.style.display = 'block';
+    camActive = true;
+    btn.textContent = 'Stop Camera';
+
+    // weapon detection: grab a frame every 800ms
+    weaponInterval = setInterval(captureAndCheckWeapon, 800);
+    // buffer frames continuously for the violence classifier
+    setInterval(bufferFrame, Math.floor((BUFFER_SECONDS*1000)/NUM_FRAMES));
+    // violence check: every 6s, using whatever is in the buffer + a short audio clip
+    violenceInterval = setInterval(checkViolence, 6000);
+    startAudioRecorder();
+  } else {
+    camStream.getTracks().forEach(t => t.stop());
+    videoEl.style.display = 'none';
+    overlay.style.display = 'none';
+    camActive = false;
+    btn.textContent = 'Start Camera';
+    clearInterval(weaponInterval);
+    clearInterval(violenceInterval);
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+  }
+}
+
+function grabFrameDataUrl() {
+  const videoEl = document.getElementById('webcam');
+  const c = document.createElement('canvas');
+  c.width = 224; c.height = 168;
+  c.getContext('2d').drawImage(videoEl, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.7);
+}
+
+function bufferFrame() {
+  if (!camActive) return;
+  frameBuffer.push(grabFrameDataUrl());
+  if (frameBuffer.length > NUM_FRAMES) frameBuffer.shift();
+}
+
+async function captureAndCheckWeapon() {
+  if (!camActive) return;
+  const dataUrl = grabFrameDataUrl();
+  const blob = await (await fetch(dataUrl)).blob();
+  const formData = new FormData();
+  formData.append('file', blob, 'frame.jpg');
+
+  try {
+    const res = await fetch('/predict_frame', { method: 'POST', body: formData });
+    const data = await res.json();
+    drawOverlay(data.detections || []);
+    document.getElementById('weaponStatus').textContent =
+      'Weapon check: ' + (data.detections && data.detections.length
+        ? data.detections.map(d => `${d.class} (${(d.conf*100).toFixed(0)}%)`).join(', ')
+        : 'none detected');
+  } catch (e) {
+    document.getElementById('weaponStatus').textContent = 'Weapon check: request failed';
+  }
+}
+
+function drawOverlay(detections) {
+  const overlay = document.getElementById('overlay');
+  const ctx = overlay.getContext('2d');
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  const scaleX = overlay.width / 224;
+  const scaleY = overlay.height / 168;
+  ctx.strokeStyle = '#ffa500';
+  ctx.lineWidth = 2;
+  ctx.font = '14px sans-serif';
+  ctx.fillStyle = '#ffa500';
+  detections.forEach(d => {
+    const [x1, y1, x2, y2] = d.box;
+    ctx.strokeRect(x1*scaleX, y1*scaleY, (x2-x1)*scaleX, (y2-y1)*scaleY);
+    ctx.fillText(`${d.class} ${(d.conf*100).toFixed(0)}%`, x1*scaleX, Math.max(y1*scaleY - 4, 10));
+  });
+}
+
+function startAudioRecorder() {
+  try {
+    mediaRecorder = new MediaRecorder(camStream, { mimeType: 'audio/webm' });
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    mediaRecorder.start();
+    // restart every 6s so we always have a fresh ~short clip aligned with checkViolence
+    setInterval(() => {
+      if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      audioChunks = [];
+      mediaRecorder.start();
+    }, 6000);
+  } catch (e) {
+    console.warn('Audio recording unavailable:', e);
+  }
+}
+
+async function checkViolence() {
+  if (!camActive || frameBuffer.length < NUM_FRAMES) {
+    document.getElementById('violenceStatus').textContent =
+      `Violence check: buffering... (${frameBuffer.length}/${NUM_FRAMES} frames)`;
+    return;
+  }
+  const formData = new FormData();
+  formData.append('frames', JSON.stringify(frameBuffer.slice(-NUM_FRAMES)));
+  if (audioChunks.length) {
+    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+    formData.append('audio', audioBlob, 'clip.webm');
+  }
+
+  try {
+    const res = await fetch('/predict_clip', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (data.error) {
+      document.getElementById('violenceStatus').textContent = 'Violence check: ' + data.error;
+      return;
+    }
+    const badgeClass = data.label === 'Violence' ? 'violence' : 'nonviolence';
+    document.getElementById('violenceStatus').innerHTML =
+      `Violence check: <span class="badge ${badgeClass}">${data.label}</span> (${(data.violence_prob*100).toFixed(1)}%, audio: ${data.audio_used ? 'yes' : 'no'})`;
+  } catch (e) {
+    document.getElementById('violenceStatus').textContent = 'Violence check: request failed';
+  }
+}
+</script>
+
+</body>
+</html>

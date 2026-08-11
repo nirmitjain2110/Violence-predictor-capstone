@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: violence-weapon-detection
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
