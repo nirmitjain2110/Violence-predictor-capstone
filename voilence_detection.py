@@ -1744,4 +1744,126 @@ demo = gr.Interface(
     title="Violence & Weapon Detection",
 )
 
-demo.launch(share=True)
+# demo.launch(share=True)
+
+
+# ==============================================================================
+# MULTI-MODAL PREDICTIVE VIOLENCE & EARLY WARNING ENGINE (Modules 1 - 5)
+# Reference: claude.md & desc.txt
+# ==============================================================================
+
+"""
+Mathematical Framework:
+1. Module 1 (Video): MobileNetV3 2D-CNN + Temporal Attention Module (TAM)
+   f_t = MobileNetV3(I_t) in R^{512},  alpha_t = softmax(w_a^T tanh(W_h h_t + b))
+   v_temporal = sum_{t=1}^{16} alpha_t h_t
+
+2. Module 2 (Audio): Log-Mel Spectrogram (64 bins) + CNN-BiLSTM with Learned Fallback
+   a_embed = BiLSTM(Conv2D(S_mel)) in R^{128}
+
+3. Module 3 (Weapons): YOLO Multi-Class Detector + Confusion Object Filter
+   w_threat = [c_firearm, c_knife, c_blunt, c_max, D_spatial, N_threat] in R^6
+
+4. Module 4 (Fusion): Gated Cross-Modal Attention Early Warning Predictor
+   F_fusion = LayerNorm(g_v z_v + g_a z_a + g_w z_w + CrossAttn(z_v, [z_a; z_w]))
+   P(V_{t + Delta t}) = sigma(W_pred * F_fusion + b_pred)
+
+5. Module 5 (Trajectory & Lead Time): Dynamic Escalation Rate & Alert Trigger
+   S(t) = dP/dt = (P(t) - P(t-k)) / (k * delta_t_frame)
+   Delta t_lead = (tau_crit - P(t)) / max(S(t), epsilon)
+   H(t) = 0.45*P(V_{t+Delta t}) + 0.25*ReLU(S(t)) + 0.20*c_weap + 0.10*a_energy
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiModalEarlyWarningPredictor(nn.Module):
+    def __init__(self, spatial_dim=512, audio_dim=128, weapon_dim=64, fused_dim=256, dropout=0.3):
+        super().__init__()
+        # Spatial 2D-CNN & TAM
+        self.gru = nn.GRU(spatial_dim, 256, num_layers=2, batch_first=True, bidirectional=True)
+        self.tam_proj = nn.Sequential(nn.Linear(512, 128), nn.Tanh())
+        self.tam_context = nn.Linear(128, 1, bias=False)
+        self.behavior_proj = nn.Sequential(nn.Linear(512, 512), nn.LayerNorm(512), nn.ReLU())
+
+        # Audio Stream (CNN-LSTM)
+        self.audio_conv = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2)
+        )
+        self.audio_lstm = nn.LSTM(32 * (64 // 4), 64, num_layers=2, batch_first=True, bidirectional=True)
+        self.audio_proj = nn.Sequential(nn.Linear(128, audio_dim), nn.LayerNorm(audio_dim), nn.ReLU())
+        self.missing_audio_embed = nn.Parameter(torch.zeros(audio_dim))
+
+        # Threat Vector MLP (6D -> 64D)
+        self.weapon_proj = nn.Sequential(
+            nn.Linear(6, 32), nn.LayerNorm(32), nn.ReLU(),
+            nn.Linear(32, weapon_dim), nn.LayerNorm(weapon_dim), nn.ReLU()
+        )
+
+        # Cross-Modal Fusion
+        self.proj_v = nn.Linear(512, fused_dim)
+        self.proj_a = nn.Linear(audio_dim, fused_dim)
+        self.proj_w = nn.Linear(weapon_dim, fused_dim)
+        self.gating = nn.Linear(fused_dim * 3, 3)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=fused_dim, num_heads=4, batch_first=True)
+        self.post_norm = nn.LayerNorm(fused_dim)
+
+        # Early Warning Predictive Head: P(V_{t+Delta t}) = sigma(W * F + b)
+        self.early_warning_head = nn.Sequential(
+            nn.Linear(fused_dim, 64), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, 64), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(64, 2)
+        )
+
+    def forward(self, temporal_spatial_feats, mel, has_audio, threat_vector):
+        # 1. TAM Temporal Modeling
+        gru_out, _ = self.gru(temporal_spatial_feats)
+        attn_scores = self.tam_context(self.tam_proj(gru_out)).squeeze(-1)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        v_context = torch.bmm(attn_weights.unsqueeze(1), gru_out).squeeze(1)
+        v_emb = self.behavior_proj(v_context)
+
+        # 2. Audio Processing
+        x_a = self.audio_conv(mel)
+        B, C, F_d, T_d = x_a.shape
+        x_a = x_a.permute(0, 3, 1, 2).reshape(B, T_d, C * F_d)
+        lstm_out, _ = self.audio_lstm(x_a)
+        a_emb = self.audio_proj(torch.mean(lstm_out, dim=1))
+        fallback = self.missing_audio_embed.unsqueeze(0).expand(B, -1)
+        mask = has_audio.view(B, 1).float()
+        a_emb = mask * a_emb + (1.0 - mask) * fallback
+
+        # 3. Weapon Threat MLP
+        w_emb = self.weapon_proj(threat_vector)
+
+        # 4. Gated Cross-Attention Fusion
+        z_v = F.relu(self.proj_v(v_emb))
+        z_a = F.relu(self.proj_a(a_emb))
+        z_w = F.relu(self.proj_w(w_emb))
+
+        g_weights = F.softmax(self.gating(torch.cat([z_v, z_a, z_w], dim=1)), dim=1)
+        g_blend = g_weights[:, 0:1] * z_v + g_weights[:, 1:2] * z_a + g_weights[:, 2:3] * z_w
+
+        kv = torch.stack([z_a, z_w], dim=1)
+        q = z_v.unsqueeze(1)
+        attn_out, _ = self.cross_attn(q, kv, kv)
+        fused = self.post_norm(g_blend + attn_out.squeeze(1))
+
+        # 5. Predictions
+        pred_future_prob = torch.sigmoid(self.early_warning_head(fused).squeeze(-1))
+        logits = self.classifier(fused)
+
+        return {
+            "future_violence_prob": pred_future_prob,
+            "logits": logits,
+            "probabilities": torch.softmax(logits, dim=-1),
+            "fused_features": fused,
+            "temporal_attention": attn_weights
+        }
+
+print("Multi-Modal Spatio-Temporal Violence Predictor & Early Warning Framework defined.")

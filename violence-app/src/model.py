@@ -24,7 +24,7 @@ class SpatioTemporalAttention(nn.Module):
 
 
 class ViolenceDetector(nn.Module):
-    def __init__(self, num_classes=2, freeze_until_layer=3, pretrained=True):
+    def __init__(self, num_classes=2, freeze_until_layer=3, pretrained=False):
         super().__init__()
         weights = R2Plus1D_18_Weights.KINETICS400_V1 if pretrained else None
         backbone = r2plus1d_18(weights=weights)

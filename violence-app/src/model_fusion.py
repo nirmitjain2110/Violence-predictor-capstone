@@ -25,11 +25,11 @@ class AudioEncoder(nn.Module):
 
 class MultimodalViolenceDetector(nn.Module):
     def __init__(self, video_backbone_ckpt=None, freeze_video_backbone=True,
-                 audio_embed_dim=128, num_classes=2):
+                 audio_embed_dim=128, num_classes=2, pretrained=False):
         super().__init__()
 
         video_model = ViolenceDetector(num_classes=num_classes, freeze_until_layer=3,
-                                        pretrained=(video_backbone_ckpt is None))
+                                        pretrained=pretrained)
         if video_backbone_ckpt is not None:
             ckpt = torch.load(video_backbone_ckpt, map_location="cpu")
             video_model.load_state_dict(ckpt["model_state"])
