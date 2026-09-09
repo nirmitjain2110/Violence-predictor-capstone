@@ -38,7 +38,7 @@ class EscalationTrajectoryAnalyzer:
     def __init__(
         self,
         critical_threshold: float = 0.65,
-        alert_threshold: float = 0.50,
+        alert_threshold: float = 0.47,
         fps: float = 5.33,  # 16 frames spanning ~3.0 seconds -> ~5.33 fps
         k_lookback: int = 3
     ):
