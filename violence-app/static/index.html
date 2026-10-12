@@ -781,14 +781,14 @@
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
       ctx.lineWidth = 1;
       ctx.beginPath();
-      const threshY = h - pad - 0.50 * (h - 2 * pad);
+      const threshY = h - pad - 0.47 * (h - 2 * pad);
       ctx.moveTo(pad, threshY);
       ctx.lineTo(w - pad, threshY);
       ctx.stroke();
 
       ctx.fillStyle = '#94a3b8';
       ctx.font = '10px JetBrains Mono';
-      ctx.fillText('τ = 0.50', pad + 4, threshY - 4);
+      ctx.fillText('τ* = 0.47 (Optimal)', pad + 4, threshY - 4);
 
       // Plot Trajectory Curve
       const n = trajectory.length;
